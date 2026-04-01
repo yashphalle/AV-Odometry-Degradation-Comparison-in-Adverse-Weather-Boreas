@@ -1,0 +1,6 @@
+# Data
+boreas_data/
+
+# Python
+__pycache__/
+.venv/

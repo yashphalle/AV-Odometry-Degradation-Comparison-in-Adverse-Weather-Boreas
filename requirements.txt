@@ -1,0 +1,8 @@
+boto3
+awscli
+pyboreas
+kiss-icp
+evo
+numpy
+matplotlib
+pandas
