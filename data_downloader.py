@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 
 import argparse
-import subprocess
 import sys
 from pathlib import Path
 
-# Known sequences by weather label
+import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
+
 SEQUENCES = {
     "clear": "boreas-2020-11-26-13-58",
-    "snow":  "boreas-2021-01-26-10-59",
+    "snow":  "boreas-2021-01-26-11-22",
     "rain":  "boreas-2021-08-05-13-34",
 }
 
-S3_BASE = "s3://boreas"
+S3_BUCKET = "boreas"
 DEFAULT_MODALITIES = ["lidar", "applanix", "calib"]
 
 
@@ -33,27 +35,56 @@ def parse_args():
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Print commands without executing"
+        help="Print what would be downloaded without downloading"
     )
     return parser.parse_args()
 
 
-def resolve_sequence(name: str) -> str:
-    """Resolve label (clear/snow/rain) or pass through full sequence name."""
+def resolve_sequence(name):
     return SEQUENCES.get(name.lower(), name)
 
 
-def sync_s3(s3_path: str, local_path: Path, dry_run: bool):
-    local_path.mkdir(parents=True, exist_ok=True)
-    cmd = ["aws", "s3", "sync", s3_path, str(local_path), "--no-sign-request"]
-    print(f"[SYNC] {s3_path} -> {local_path}")
-    if dry_run:
-        print(f"  [DRY RUN] Would run: {' '.join(cmd)}")
-        return
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        print(f"[ERROR] Failed: {' '.join(cmd)}", file=sys.stderr)
-        sys.exit(1)
+def download_sequence(seq_name, output_dir, modalities=None, dry_run=False):
+    if modalities is None:
+        modalities = DEFAULT_MODALITIES
+
+    s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+
+    for modality in modalities:
+        prefix = f"{seq_name}/{modality}/"
+        local_base = output_dir / seq_name / modality
+        local_base.mkdir(parents=True, exist_ok=True)
+
+        print(f"[DOWNLOAD] s3://{S3_BUCKET}/{prefix} -> {local_base}")
+
+        if dry_run:
+            print(f"  [DRY RUN] Would download s3://{S3_BUCKET}/{prefix}")
+            continue
+
+        paginator = s3.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix)
+
+        files_downloaded = 0
+        files_skipped = 0
+
+        for page in pages:
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                s3_size = obj["Size"]
+                filename = Path(key).name
+                local_path = local_base / filename
+
+                if local_path.exists() and local_path.stat().st_size == s3_size:
+                    files_skipped += 1
+                    continue
+
+                s3.download_file(S3_BUCKET, key, str(local_path))
+                files_downloaded += 1
+
+                if files_downloaded % 100 == 0:
+                    print(f"  Downloaded {files_downloaded} files...")
+
+        print(f"  Done — {files_downloaded} new, {files_skipped} already present")
 
 
 def main():
@@ -63,10 +94,7 @@ def main():
     for seq_input in args.sequences:
         seq_name = resolve_sequence(seq_input)
         print(f"\n=== Downloading: {seq_name} ===")
-        for modality in args.modalities:
-            s3_path = f"{S3_BASE}/{seq_name}/{modality}/"
-            local_path = output_dir / seq_name / modality
-            sync_s3(s3_path, local_path, args.dry_run)
+        download_sequence(seq_name, output_dir, modalities=args.modalities, dry_run=args.dry_run)
 
     print("\nDone.")
 

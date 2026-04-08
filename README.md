@@ -1,6 +1,6 @@
-# AV Odometry Degradation Comparison in Adverse Weather — Boreas
+# AV Odometry Degradation Comparison in Adverse Weather - Boreas
 
-EECE5554 Robotics: Sensing and Navigation — Team 10
+EECE5554 Robotics: Sensing and Navigation - Team 10
 
 LiDAR and visual odometry algorithm degradation under adverse weather (snow, rain) using the [Boreas](https://www.boreas.utias.utoronto.ca/) multi-season autonomous driving dataset. Trajectories are evaluated against accurate GPS/IMU ground truth using ATE and RPE metrics.
 
