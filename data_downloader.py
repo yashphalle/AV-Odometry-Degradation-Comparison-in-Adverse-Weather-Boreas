@@ -9,9 +9,9 @@ from botocore import UNSIGNED
 from botocore.config import Config
 
 SEQUENCES = {
-    "clear": "boreas-2020-11-26-13-58",
+    "clear": "boreas-2021-04-08-12-44",
     "snow":  "boreas-2021-01-26-11-22",
-    "rain":  "boreas-2021-08-05-13-34",
+    "rain":  "boreas-2021-07-20-17-33",
 }
 
 S3_BUCKET = "boreas"
