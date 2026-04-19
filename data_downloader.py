@@ -44,11 +44,17 @@ def resolve_sequence(name):
     return SEQUENCES.get(name.lower(), name)
 
 
-def download_sequence(seq_name, output_dir, modalities=None, dry_run=False):
+def download_sequence(seq_name, output_dir, modalities=None, dry_run=False, max_files=None):
+    """
+    Download Boreas sequence modalities from S3. Resume-safe.
+    max_files: if set, limits files downloaded for the 'camera' modality only.
+               applanix and calib are always downloaded in full.
+    """
     if modalities is None:
         modalities = DEFAULT_MODALITIES
 
     s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+    paginator = s3.get_paginator("list_objects_v2")
 
     for modality in modalities:
         prefix = f"{seq_name}/{modality}/"
@@ -61,30 +67,36 @@ def download_sequence(seq_name, output_dir, modalities=None, dry_run=False):
             print(f"  [DRY RUN] Would download s3://{S3_BUCKET}/{prefix}")
             continue
 
-        paginator = s3.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix)
+        # Collect all objects for this modality
+        all_objects = []
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                all_objects.append((obj["Key"], obj["Size"]))
+        all_objects.sort(key=lambda x: x[0])
+
+        # Limit camera frames if max_files is set
+        if modality == "camera" and max_files:
+            all_objects = all_objects[:max_files]
+            print(f"  [LIMITED] Downloading first {len(all_objects)} camera files")
 
         files_downloaded = 0
         files_skipped = 0
 
-        for page in pages:
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                s3_size = obj["Size"]
-                filename = Path(key).name
-                local_path = local_base / filename
+        for key, s3_size in all_objects:
+            filename = Path(key).name
+            local_path = local_base / filename
 
-                if local_path.exists() and local_path.stat().st_size == s3_size:
-                    files_skipped += 1
-                    continue
+            if local_path.exists() and local_path.stat().st_size == s3_size:
+                files_skipped += 1
+                continue
 
-                s3.download_file(S3_BUCKET, key, str(local_path))
-                files_downloaded += 1
+            s3.download_file(S3_BUCKET, key, str(local_path))
+            files_downloaded += 1
 
-                if files_downloaded % 100 == 0:
-                    print(f"  Downloaded {files_downloaded} files...")
+            if files_downloaded % 100 == 0:
+                print(f"  Downloaded {files_downloaded} files...")
 
-        print(f"  Done — {files_downloaded} new, {files_skipped} already present")
+        print(f"  {modality} done — {files_downloaded} new, {files_skipped} already present")
 
 
 def main():
