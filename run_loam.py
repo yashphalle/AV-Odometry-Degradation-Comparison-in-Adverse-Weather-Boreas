@@ -16,7 +16,13 @@ SEQUENCES = {
 }
 
 
+# ── Downloader ────────────────────────────────────────────────────────────────
+
 def download_sequence(seq_name, output_dir, max_scans=None):
+    """
+    Download lidar scans (up to max_scans), applanix GT, and calib from S3.
+    Resume-safe: skips files already present with correct size.
+    """
     import boto3
     from botocore import UNSIGNED
     from botocore.config import Config
@@ -24,21 +30,24 @@ def download_sequence(seq_name, output_dir, max_scans=None):
     s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
     seq_dir = output_dir / seq_name
 
+    # ── Lidar scans (limited to max_scans if set) ──────────────────────────
     lidar_dir = seq_dir / "lidar"
     lidar_dir.mkdir(parents=True, exist_ok=True)
     print(f"[DOWNLOAD] Listing lidar scans ...", flush=True)
 
     paginator = s3.get_paginator("list_objects_v2")
-    all_keys = []
+    all_keys  = []
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{seq_name}/lidar/"):
         for obj in page.get("Contents", []):
             if obj["Key"].endswith(".bin"):
                 all_keys.append((obj["Key"], obj["Size"]))
 
-    all_keys.sort(key=lambda x: x[0])
+    all_keys.sort(key=lambda x: x[0])  # sort by filename = chronological
     if max_scans:
         all_keys = all_keys[:max_scans]
-    print(f"  Downloading {len(all_keys)} scans ...", flush=True)
+        print(f"  Downloading first {max_scans} of {len(all_keys)} scans ...", flush=True)
+    else:
+        print(f"  Downloading all {len(all_keys)} scans ...", flush=True)
 
     for n, (key, s3_size) in enumerate(all_keys):
         local = lidar_dir / Path(key).name
@@ -49,14 +58,15 @@ def download_sequence(seq_name, output_dir, max_scans=None):
             print(f"  {n + 1}/{len(all_keys)} scans downloaded ...", flush=True)
     print(f"  Lidar done.", flush=True)
 
+    # ── Applanix GT + calib (always full) ─────────────────────────────────
     for modality in ["applanix", "calib"]:
         mod_dir = seq_dir / modality
         mod_dir.mkdir(parents=True, exist_ok=True)
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{seq_name}/{modality}/"):
             for obj in page.get("Contents", []):
-                key     = obj["Key"]
-                s3_size = obj["Size"]
-                local   = mod_dir / Path(key).name
+                key      = obj["Key"]
+                s3_size  = obj["Size"]
+                local    = mod_dir / Path(key).name
                 if local.exists() and local.stat().st_size == s3_size:
                     continue
                 s3.download_file(S3_BUCKET, key, str(local))
@@ -65,7 +75,14 @@ def download_sequence(seq_name, output_dir, max_scans=None):
     return seq_dir
 
 
+# ── Point cloud loading ────────────────────────────────────────────────────────
+
 def load_bin(bin_file, min_range=0.5, max_range=100.0):
+    """
+    Load Boreas .bin file.
+    Format: Nx6 float32 (x, y, z, intensity, ring, time)
+    Returns xyz float64 (Nx3) and integer ring IDs (N,).
+    """
     points = np.fromfile(bin_file, dtype=np.float32).reshape(-1, 6)
     xyz    = points[:, :3].astype(np.float64)
     rings  = points[:, 4].astype(np.int32)
@@ -79,7 +96,14 @@ def load_bin(bin_file, min_range=0.5, max_range=100.0):
     return xyz[valid], rings[valid]
 
 
+# ── LOAM feature extraction ────────────────────────────────────────────────────
+
 def extract_features(xyz, rings, n_edge=20, n_planar=80, edge_thresh=0.1):
+    """
+    Compute per-point curvature within each ring using vectorised numpy cumsum,
+    then select edge (high curvature) and planar (low curvature) points.
+    Returns edge_pts (Ex3) and planar_pts (Px3) as float64 arrays.
+    """
     half = 5
     curvature = np.zeros(len(xyz))
     edge_idx, planar_idx = [], []
@@ -89,17 +113,20 @@ def extract_features(xyz, rings, n_edge=20, n_planar=80, edge_thresh=0.1):
         if len(idx) < 2 * half + 1:
             continue
 
-        pts  = xyz[idx]
-        M    = len(pts)
-        cs   = np.cumsum(pts, axis=0)
+        pts    = xyz[idx]           # (M, 3) points in ring order
+        M      = len(pts)
+        cs     = np.cumsum(pts, axis=0)  # prefix sum for O(1) window sums
 
-        i_vals = np.arange(half, M - half)
-        r_vals = i_vals + half
-        l_vals = i_vals - half - 1
+        # Valid interior range
+        i_vals = np.arange(half, M - half)           # centre indices in ring
+        r_vals = i_vals + half                        # right edge of window
+        l_vals = i_vals - half - 1                   # one before left edge
 
+        # Rolling sum of 2*half+1 neighbours (includes centre point)
         win = cs[r_vals].copy()
         win[l_vals >= 0] -= cs[l_vals[l_vals >= 0]]
 
+        # diff = sum_of_neighbours - (2*half+1)*centre
         diff = win - (2 * half + 1) * pts[i_vals]
         c    = np.sum(diff ** 2, axis=1)
 
@@ -114,35 +141,49 @@ def extract_features(xyz, rings, n_edge=20, n_planar=80, edge_thresh=0.1):
     return edge_pts, planar_pts
 
 
+# ── KD-tree helpers ────────────────────────────────────────────────────────────
+
 def build_kdtree(pts):
     from scipy.spatial import KDTree
     return KDTree(pts), pts
 
 
 def knn(tree, pts_ref, query, k):
+    """Return k nearest neighbours from pts_ref for each point in query."""
     _, idx = tree.query(query, k=k)
     return pts_ref[np.asarray(idx)]
 
 
+# ── Residual functions for point-to-line and point-to-plane ──────────────────
+
 def point_to_line_residuals(pose_vec, src, line_a, line_b):
+    """
+    pose_vec: [rx, ry, rz, tx, ty, tz]  (axis-angle + translation)
+    For each src point, compute distance to line defined by line_a, line_b.
+    """
     R = Rotation.from_rotvec(pose_vec[:3]).as_matrix()
     t = pose_vec[3:]
     transformed = (R @ src.T).T + t
 
-    ab      = line_b - line_a
-    ap      = transformed - line_a
-    cross   = np.cross(ap, ab)
+    ab  = line_b - line_a
+    ap  = transformed - line_a
+    cross = np.cross(ap, ab)
     ab_norm = np.linalg.norm(ab, axis=1, keepdims=True) + 1e-9
     return np.linalg.norm(cross, axis=1) / ab_norm.squeeze()
 
 
 def point_to_plane_residuals(pose_vec, src, plane_pts):
+    """
+    pose_vec: [rx, ry, rz, tx, ty, tz]
+    For each src point, compute signed distance to plane fitted through 3 plane_pts.
+    plane_pts: (N, 3, 3) — three neighbours per query point.
+    """
     R = Rotation.from_rotvec(pose_vec[:3]).as_matrix()
     t = pose_vec[3:]
     transformed = (R @ src.T).T + t
 
-    v1      = plane_pts[:, 1] - plane_pts[:, 0]
-    v2      = plane_pts[:, 2] - plane_pts[:, 0]
+    v1 = plane_pts[:, 1] - plane_pts[:, 0]
+    v2 = plane_pts[:, 2] - plane_pts[:, 0]
     normals = np.cross(v1, v2)
     norms   = np.linalg.norm(normals, axis=1, keepdims=True) + 1e-9
     normals = normals / norms
@@ -151,10 +192,18 @@ def point_to_plane_residuals(pose_vec, src, plane_pts):
     return np.einsum('ij,ij->i', transformed - d, normals)
 
 
+# ── Pose optimisation ─────────────────────────────────────────────────────────
+
 def optimise_pose(pose_vec,
                   edge_src, edge_tree, edge_ref,
                   planar_src, planar_tree, planar_ref,
                   max_correspondence=2.0):
+    """
+    One Levenberg-Marquardt iteration over edge + planar residuals.
+    Correspondences are fixed before optimisation so residual size is constant.
+    Returns refined pose_vec.
+    """
+    # Pre-compute correspondences at the initial pose estimate
     R0 = Rotation.from_rotvec(pose_vec[:3]).as_matrix()
     t0 = pose_vec[3:]
 
@@ -177,11 +226,12 @@ def optimise_pose(pose_vec,
                 planar_src_fixed.append(planar_src[i])
                 triplets_fixed.append(nbrs)
 
-    if len(edge_src_fixed) + len(planar_src_fixed) < 6:
-        return pose_vec
-
     has_edge   = len(edge_src_fixed)   > 0
     has_planar = len(planar_src_fixed) > 0
+
+    # LM requires n_residuals >= n_variables (6); bail out if not enough correspondences
+    if len(edge_src_fixed) + len(planar_src_fixed) < 6:
+        return pose_vec
 
     e_src = np.array(edge_src_fixed)   if has_edge   else None
     la    = np.array(la_fixed)         if has_edge   else None
@@ -189,6 +239,7 @@ def optimise_pose(pose_vec,
     p_src = np.array(planar_src_fixed) if has_planar else None
     trips = np.array(triplets_fixed)   if has_planar else None
 
+    # Fixed-size residuals function — size never changes during optimisation
     def residuals(pv):
         res = []
         if has_edge:
@@ -201,11 +252,15 @@ def optimise_pose(pose_vec,
     return result.x
 
 
+# ── Voxel map ─────────────────────────────────────────────────────────────────
+
 class VoxelMap:
+    """Lightweight voxel accumulator for edge/planar features."""
+
     def __init__(self, voxel_size=2.0, max_pts_per_voxel=20):
         self.voxel_size = voxel_size
-        self.max_pts    = max_pts_per_voxel
-        self._map       = {}
+        self.max_pts   = max_pts_per_voxel
+        self._map      = {}
 
     def insert(self, pts):
         keys = np.floor(pts / self.voxel_size).astype(int)
@@ -220,30 +275,44 @@ class VoxelMap:
         return np.vstack([np.array(v) for v in self._map.values()])
 
 
+# ── TUM output ────────────────────────────────────────────────────────────────
+
 def save_tum(poses, timestamps, out_path):
+    """Save 4x4 pose matrices as TUM trajectory format."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         for ts, pose in zip(timestamps, poses):
             t = pose[:3, 3]
-            q = Rotation.from_matrix(pose[:3, :3]).as_quat()
+            q = Rotation.from_matrix(pose[:3, :3]).as_quat()  # [qx qy qz qw]
             f.write(f"{ts:.6f} {t[0]:.6f} {t[1]:.6f} {t[2]:.6f} "
                     f"{q[0]:.6f} {q[1]:.6f} {q[2]:.6f} {q[3]:.6f}\n")
     print(f"\n[SAVED] TUM poses -> {out_path}")
 
 
+# ── Main LOAM loop ────────────────────────────────────────────────────────────
+
 def run_loam(bin_files, out_path, map_update_every=5):
+    """
+    LOAM scan-by-scan:
+      1. Extract edge + planar features per scan.
+      2. Scan-to-scan odometry via point-to-line / point-to-plane ICP.
+      3. Scan-to-map refinement every `map_update_every` frames.
+    """
     print(f"\n[LOAM] Processing {len(bin_files)} scans", flush=True)
 
-    poses        = []
-    timestamps   = []
-    current_pose = np.eye(4)
-    pose_vec     = np.zeros(6)
+    poses      = []
+    timestamps = []
 
+    current_pose = np.eye(4)          # global pose accumulator
+    pose_vec     = np.zeros(6)        # [rx ry rz tx ty tz] for optimiser
+
+    # Previous scan features (for scan-to-scan)
     prev_edge_tree   = None
     prev_edge_ref    = None
     prev_planar_tree = None
     prev_planar_ref  = None
 
+    # Global feature maps (for scan-to-map refinement)
     edge_map   = VoxelMap(voxel_size=2.0)
     planar_map = VoxelMap(voxel_size=2.0)
 
@@ -269,23 +338,26 @@ def run_loam(bin_files, out_path, map_update_every=5):
 
         if i == 0:
             print(f"  Edge pts: {len(edge_pts)}  Planar pts: {len(planar_pts)}", flush=True)
+            print(f"  Building KD-trees ...", flush=True)
 
         if i == 0:
+            # First frame — no reference, just initialise maps
             if len(edge_pts)   > 0: edge_map.insert(edge_pts)
             if len(planar_pts) > 0: planar_map.insert(planar_pts)
 
             prev_edge_tree, prev_edge_ref     = (build_kdtree(edge_pts)
                                                   if len(edge_pts) > 0
-                                                  else (None, np.empty((0, 3))))
+                                                  else (None, np.empty((0,3))))
             prev_planar_tree, prev_planar_ref = (build_kdtree(planar_pts)
                                                   if len(planar_pts) > 0
-                                                  else (None, np.empty((0, 3))))
+                                                  else (None, np.empty((0,3))))
 
             poses.append(current_pose.copy())
             timestamps.append(ts_sec)
             print(f"  Frame 0 done — entering main loop ...", flush=True)
             continue
 
+        # ── Stage 1: scan-to-scan odometry ──────────────────────────────────
         if prev_edge_tree is not None and prev_planar_tree is not None:
             pose_vec = optimise_pose(
                 pose_vec,
@@ -293,10 +365,12 @@ def run_loam(bin_files, out_path, map_update_every=5):
                 planar_pts, prev_planar_tree, prev_planar_ref,
             )
 
+        # Relative transform from pose_vec
         T_rel         = np.eye(4)
         T_rel[:3, :3] = Rotation.from_rotvec(pose_vec[:3]).as_matrix()
         T_rel[:3,  3] = pose_vec[3:]
 
+        # ── Stage 2: scan-to-map refinement (every N frames) ────────────────
         if i % map_update_every == 0:
             map_edge_arr   = edge_map.to_array()
             map_planar_arr = planar_map.to_array()
@@ -305,6 +379,7 @@ def run_loam(bin_files, out_path, map_update_every=5):
                 map_edge_tree,   _ = build_kdtree(map_edge_arr)
                 map_planar_tree, _ = build_kdtree(map_planar_arr)
 
+                # World-frame pose after applying T_rel
                 T_world_guess = current_pose @ T_rel
                 R_cur = T_world_guess[:3, :3]
                 t_cur = T_world_guess[:3, 3]
@@ -318,25 +393,30 @@ def run_loam(bin_files, out_path, map_update_every=5):
                     planar_world, map_planar_tree, map_planar_arr,
                 )
 
+                # Reconstruct refined world pose and convert back to T_rel
                 T_world_refined         = np.eye(4)
                 T_world_refined[:3, :3] = Rotation.from_rotvec(refined_vec[:3]).as_matrix()
                 T_world_refined[:3,  3] = refined_vec[3:]
                 T_rel = np.linalg.inv(current_pose) @ T_world_refined
 
+        # Accumulate global pose
         current_pose = current_pose @ T_rel
 
+        # Insert features (in world frame) into maps
         R_g = current_pose[:3, :3]
         t_g = current_pose[:3, 3]
         if len(edge_pts)   > 0: edge_map.insert((R_g @ edge_pts.T).T + t_g)
         if len(planar_pts) > 0: planar_map.insert((R_g @ planar_pts.T).T + t_g)
 
+        # Update previous scan references
         prev_edge_tree, prev_edge_ref     = (build_kdtree(edge_pts)
                                               if len(edge_pts) > 0
-                                              else (None, np.empty((0, 3))))
+                                              else (None, np.empty((0,3))))
         prev_planar_tree, prev_planar_ref = (build_kdtree(planar_pts)
                                               if len(planar_pts) > 0
-                                              else (None, np.empty((0, 3))))
+                                              else (None, np.empty((0,3))))
 
+        # Use current T_rel as motion prediction for next scan (constant velocity)
         pose_vec = np.concatenate([
             Rotation.from_matrix(T_rel[:3, :3]).as_rotvec(),
             T_rel[:3, 3]
@@ -353,7 +433,10 @@ def run_loam(bin_files, out_path, map_update_every=5):
     save_tum(poses, timestamps, out_path)
 
 
+# ── Validation ────────────────────────────────────────────────────────────────
+
 def validate_sequence(seq_path):
+    """Validate sequence folder. Returns sorted bin file list."""
     print(f"\n[VALIDATE] {seq_path}")
 
     for sub in ["lidar", "applanix", "calib"]:
@@ -378,21 +461,23 @@ def validate_sequence(seq_path):
     return bin_files
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run LOAM on a Boreas sequence."
+        description="Run LOAM on a Boreas sequence (data must already be downloaded)."
     )
-    parser.add_argument("--sequence",  default=None,
+    parser.add_argument("--sequence", default=None,
                         help="Weather label (clear/snow/rain) — used with --download")
-    parser.add_argument("--data",      default=None,
+    parser.add_argument("--data",    default=None,
                         help="Path to already-downloaded sequence folder")
-    parser.add_argument("--download",  action="store_true",
+    parser.add_argument("--download", action="store_true",
                         help="Download data from S3 before running (requires --sequence)")
-    parser.add_argument("--output",    default="boreas_data",
+    parser.add_argument("--output",  default="boreas_data",
                         help="Root dir for downloaded data (default: boreas_data/)")
-    parser.add_argument("--label",     default=None,
+    parser.add_argument("--label",   default=None,
                         help="Weather label for output folder (clear/snow/rain)")
-    parser.add_argument("--results",   default="results",
+    parser.add_argument("--results", default="results",
                         help="Root directory for output poses (default: results/)")
     parser.add_argument("--map-update-every", type=int, default=5,
                         help="Run scan-to-map refinement every N frames (default: 5)")
@@ -404,12 +489,13 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # ── Resolve sequence path ──────────────────────────────────────────────
     if args.download:
         if not args.sequence:
             print("[ERROR] --download requires --sequence (clear/snow/rain)", file=sys.stderr)
             sys.exit(1)
-        seq_name   = SEQUENCES.get(args.sequence.lower(), args.sequence)
-        label      = args.label or args.sequence.lower()
+        seq_name = SEQUENCES.get(args.sequence.lower(), args.sequence)
+        label    = args.label or args.sequence.lower()
         output_dir = Path(args.output).expanduser()
         print(f"[DOWNLOAD] Fetching {seq_name} (max_scans={args.max_scans}) ...", flush=True)
         seq_path = download_sequence(seq_name, output_dir, max_scans=args.max_scans)
@@ -426,6 +512,10 @@ def main():
     print(f"Sequence : {seq_path}", flush=True)
     print(f"Label    : {label}", flush=True)
     print(f"Output   : {out_path}", flush=True)
+
+    print("[STEP 1] Importing scipy ...", flush=True)
+    import scipy
+    print(f"  scipy {scipy.__version__} OK", flush=True)
 
     bin_files = validate_sequence(seq_path)
     if args.max_scans:
