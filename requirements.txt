@@ -1,6 +1,6 @@
 boto3
 awscli
-pyboreas
+asrl-pyboreas
 kiss-icp
 evo
 numpy
